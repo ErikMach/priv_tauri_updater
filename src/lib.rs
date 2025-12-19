@@ -47,25 +47,6 @@ struct GitHubAsset {
     browser_download_url:	String,
 }
 
-#[derive(Clone)]
-struct ServerInfo {
-    assets:		HashMap<String, String>,
-    client:		Client,
-    download_url_base:	String,
-    server_addr:	String,
-}
-
-impl ServerInfo {
-    fn from(priv_updater: &PrivUpdater) -> ServerInfo {
-	ServerInfo {
-	    assets:		priv_updater.assets.clone(),
-	    client:		priv_updater.client.clone(),
-	    download_url_base:	priv_updater.download_url_base.clone(),
-	    server_addr:	priv_updater.server_addr.to_string(),
-	}
-    }
-}
-
 /// Holds all the necessary info to serve a reverse-proxy to your private github repo
 pub struct PrivUpdater {
     server_addr:	SocketAddr,
@@ -143,25 +124,36 @@ impl PrivUpdater {
 	})
     }
     /// Serve the update at the `server_addr` passed to `PrivUpdater::new()` (default: `127.0.0.1:7748`)
-    pub async fn serve_update(&mut self) -> Result<(), Box<dyn Error>> {
-	let server_info: ServerInfo = ServerInfo::from(self);
+    pub async fn serve_update(mut self) -> Result<oneshot::Sender<()>, Box<dyn Error>> {
+	let (
+	    assets,
+	    client,
+	    server_addr,
+	    download_url_base,
+	) = (
+	    self.assets.clone(),
+	    self.client.clone(),
+	    String::from("http://") + &self.server_addr.to_string(),
+	    self.download_url_base.clone(),
+	);
 	let routes = warp::path::param::<String>()
-	    .and(warp::any().map(move || server_info.clone() ))
+	    .and(warp::any().map(move || assets.clone() ))
+	    .and(warp::any().map(move || client.clone() ))
+	    .and(warp::any().map(move || server_addr.clone() ))
+	    .and(warp::any().map(move || download_url_base.clone() ))
 	    .and_then(move |
-		filename: String,
-		ServerInfo {
-		    assets,
-		    client,
-		    server_addr,
-		    download_url_base,
-		}: ServerInfo
+		filename:		String,
+		assets:			HashMap<String, String>,
+		client:			Client,
+		server_addr:		String,
+		download_url_base:	String,
 	    | {	async move {
 		let url: &String  = match assets.get(&filename) {
 		    Some(value)	=> value,
 		    None	=> return Err(warp::reject::not_found()),
 		};
 		if filename == "latest.json" {
-		    get_latest_json(&client, url, &download_url_base, &server_addr)
+		    get_latest_json(&client, url, &download_url_base, &server_addr.to_string())
 			.await
 			.map_err(|e| warp::reject::custom(ReqwestError(e)) )
 		} else {
@@ -171,18 +163,21 @@ impl PrivUpdater {
 		}
 	    }});
 
+/*
 	let (tx, rx) = oneshot::channel::<()>();
 
 	let (_addr, server) = warp::serve(routes)
-	    .bind_with_graceful_shutdown(self.server_addr, async {
+	    .try_bind_with_graceful_shutdown(self.server_addr, async {
 	         rx.await.ok();
-	    });
+	    })?;
+*/
+	let (tx, addr, server) = self.serve_with_retry(routes)?;
+
+println!("Serving on: {:#?}", addr);
 
 	tokio::task::spawn(server);
 
-	self.shutdown_signal = Some(tx);
-
-	Ok(())	
+	Ok( tx )	
     }
     /// Shutdown the update server
     pub fn shutdown(&mut self) {
@@ -190,7 +185,31 @@ impl PrivUpdater {
 	    let _ = sender.send(());
 	}
     }
+    fn serve_with_retry<F>(&mut self, routes: F) -> Result<(oneshot::Sender<()>, SocketAddr, impl Future<Output = ()> + 'static), String>
+    where
+	F: Filter + Clone + Send + Sync + 'static,
+	F::Extract: Reply,
+    {
+	static COUNTER: AtomicU8 = AtomicU8::new(0);
+
+	let (tx, rx) = oneshot::channel::<()>();
+
+	if let Ok(( addr, server )) = warp::serve(routes.clone())
+	    .try_bind_with_graceful_shutdown(self.server_addr, async { rx.await.ok(); })
+	{
+	    Ok(( tx, addr, server ))
+	} else if COUNTER.load(Ordering::Acquire) > 10 {
+		Err(String::from("Unable to find unused port"))
+	} else {
+	    self.server_addr.set_port((self.server_addr.port() + 1) % 1000);
+	    COUNTER.fetch_add(1, Ordering::Relaxed);
+	    self.serve_with_retry(routes)
+	}
+    }
 }
+
+use warp::Reply;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 async fn get_latest_json(client: &Client, url: &str, download_url_base: &str, server_addr: &str) -> Result<Vec<u8>, reqwest::Error> {
     let text: String = client.get(url).send().await?.text().await?;
@@ -208,6 +227,8 @@ async fn get_file(client: &Client, url: &str) -> Result<Vec<u8>, reqwest::Error>
 /// ```rust
 /// // in `src-tauri/src/lib.rs`
 /// # use std::error::Error;
+/// # use priv_tauri_updater::PrivUpdater;
+/// # use tauri::{AppHandle}
 ///
 /// async fn update(app: tauri::AppHandle) -> Result<(), Box<dyn Error>> {
 ///     let update_server = priv_tauri_updater::serve("MyAccount", "MyRepo", "MyGitHubToken").await?;
@@ -232,8 +253,8 @@ async fn get_file(client: &Client, url: &str) -> Result<Vec<u8>, reqwest::Error>
 /// - `gh_account_name`, `gh_repo_name`, or `gh_token` are incorrect for GitHub or invalid as HeaderNames (see [reqwest docs](https://docs.rs/reqwest/latest/reqwest/header/struct.HeaderValue.html#method.from_str))
 /// - there are network errors (e.g. no internet connection)
 /// - the server address `http://127.0.0.1:7748` is already in use
-pub async fn serve<D: std::fmt::Display>(gh_account_name: D, gh_repo_name: D, gh_token: D) -> Result<PrivUpdater, Box<dyn Error>> {
-    let mut updater = PrivUpdater::new(gh_account_name, gh_repo_name, gh_token, None::<([u8; 4], u16)>).await?;
-    updater.serve_update().await?;
-    Ok( updater )
+pub async fn serve<D: std::fmt::Display>(gh_account_name: D, gh_repo_name: D, gh_token: D) -> Result<oneshot::Sender<()>, Box<dyn Error>> {
+    let updater = PrivUpdater::new(gh_account_name, gh_repo_name, gh_token, None::<([u8; 4], u16)>).await?;
+    let shutdown_signal = updater.serve_update().await?;
+    Ok( shutdown_signal )
 }

@@ -5,7 +5,7 @@ use super::*;
 // use reqwest::Client;
 
 #[tokio::test]
-async fn it_works() {
+async fn updater_create_error() {
     assert!(
 	PrivUpdater::new(
 	    "ErikMach",
