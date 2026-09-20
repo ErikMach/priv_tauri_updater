@@ -1,9 +1,9 @@
-//! This lib is creates a local server (reverse-proxy) for the latest release of a private github repo
+//! `PrivUpdater` creates a local server (reverse-proxy) for the latest release of a private github repo
 //! so that a Tauri app can happily get the update.
 //!
 //! This requires a few changes but it turns out great...
-
 #![warn(missing_docs)]
+
 mod test;
 
 use reqwest::{
@@ -22,18 +22,38 @@ use std::{
     error::Error,
     collections::HashMap,
     net::{ IpAddr, Ipv4Addr, SocketAddr },
+    sync::atomic::{ AtomicU8, Ordering },
 };
 use warp::{
+    Reply,
     Filter, 
     reject::Reject as WarpReject,
 };
-use tokio::sync::oneshot;
+use tokio::{
+    sync::oneshot,
+    net::TcpListener,
+};
 
 #[derive(Debug)]
 #[allow(dead_code)]
 struct ReqwestError(reqwest::Error);
 
 impl WarpReject for ReqwestError {}
+
+/// The shutdown signal for a server
+///
+/// Returned from creating a server with `PrivUpdater::new` or `serve`
+#[derive(Debug)]
+pub struct ShutdownSignal(oneshot::Sender<()>);
+
+impl ShutdownSignal {
+    /// Shutdown the server
+    ///
+    /// Note: this frees up the server address port that the server was running on
+    pub fn shutdown(self) {
+	let _ = self.0.send(());
+    }
+}
 
 #[derive(Deserialize)]
 struct GitHubAssetsList {
@@ -48,12 +68,12 @@ struct GitHubAsset {
 }
 
 /// Holds all the necessary info to serve a reverse-proxy to your private github repo
+#[derive(Debug)]
 pub struct PrivUpdater {
     server_addr:	SocketAddr,
     client:		reqwest::Client,
     assets:		HashMap<String, String>,
     download_url_base:	String,
-    shutdown_signal:	Option<oneshot::Sender<()>>,
 }
 
 impl PrivUpdater {
@@ -67,15 +87,24 @@ impl PrivUpdater {
     ///
     /// This function fails if `gh_account_name`, `gh_repo_name`, or `gh_token` are incorrect for GitHub
     /// or invalid as HeaderNames (see [reqwest docs](https://docs.rs/reqwest/latest/reqwest/header/struct.HeaderValue.html#method.from_str)).
+    ///
     /// # Examples
     ///
-    /// ```rust
-    /// let updater = PrivUpdater::new(
-    ///     "MyGitHubAccount",
-    ///     "MyGitHubRepo",
-    ///     "MyGitHubToken",
-    ///     ([127, 0, 0, 1], 8080)
-    /// ).await?;
+    /// ```no_run
+    /// // This example is not run since it uses dummy data to create the server, which will return an error
+    /// # use tokio;
+    /// use priv_tauri_updater::PrivUpdater;
+    ///
+    /// # #[tokio::main(flavor = "current_thread")]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let updater = PrivUpdater::new(
+    ///         "MyGitHubAccount",
+    ///         "MyGitHubRepo",
+    ///         "MyGitHubToken",
+    ///         Some(([127, 0, 0, 1], 8080))
+    ///     ).await?;
+    ///     # Ok(())
+    /// # }
     /// ```
     pub async fn new<D, S>(gh_account_name: D, gh_repo_name: D, gh_token: D, server_addr: Option<S>) -> Result<Self, Box<dyn Error>>
     where
@@ -120,11 +149,10 @@ impl PrivUpdater {
 	    client,
 	    assets,
 	    download_url_base,
-	    shutdown_signal: None,
 	})
     }
     /// Serve the update at the `server_addr` passed to `PrivUpdater::new()` (default: `127.0.0.1:7748`)
-    pub async fn serve_update(mut self) -> Result<oneshot::Sender<()>, Box<dyn Error>> {
+    pub async fn serve_update(mut self) -> Result<ShutdownSignal, Box<dyn Error>> {
 	let (
 	    assets,
 	    client,
@@ -163,29 +191,11 @@ impl PrivUpdater {
 		}
 	    }});
 
-/*
-	let (tx, rx) = oneshot::channel::<()>();
+	let tx = self.serve_with_retry(routes).await?;
 
-	let (_addr, server) = warp::serve(routes)
-	    .try_bind_with_graceful_shutdown(self.server_addr, async {
-	         rx.await.ok();
-	    })?;
-*/
-	let (tx, addr, server) = self.serve_with_retry(routes)?;
-
-println!("Serving on: {:#?}", addr);
-
-	tokio::task::spawn(server);
-
-	Ok( tx )	
+	Ok( ShutdownSignal(tx) )	
     }
-    /// Shutdown the update server
-    pub fn shutdown(&mut self) {
-	if let Some(sender) = self.shutdown_signal.take() {
-	    let _ = sender.send(());
-	}
-    }
-    fn serve_with_retry<F>(&mut self, routes: F) -> Result<(oneshot::Sender<()>, SocketAddr, impl Future<Output = ()> + 'static), String>
+    async fn serve_with_retry<F>(&mut self, routes: F) -> Result<oneshot::Sender<()>, String>
     where
 	F: Filter + Clone + Send + Sync + 'static,
 	F::Extract: Reply,
@@ -194,48 +204,42 @@ println!("Serving on: {:#?}", addr);
 
 	let (tx, rx) = oneshot::channel::<()>();
 
-	if let Ok(( addr, server )) = warp::serve(routes.clone())
-	    .try_bind_with_graceful_shutdown(self.server_addr, async { rx.await.ok(); })
-	{
-	    Ok(( tx, addr, server ))
+	if let Ok(listener) = TcpListener::bind(self.server_addr).await {
+	    tokio::task::spawn(
+		warp::serve(routes.clone())
+		    .incoming(listener)
+		    .graceful(async { rx.await.ok(); })
+		    .run()
+	    );
+	    Ok(tx)
 	} else if COUNTER.load(Ordering::Acquire) > 10 {
 		Err(String::from("Unable to find unused port"))
 	} else {
 	    self.server_addr.set_port((self.server_addr.port() + 1) % 1000);
 	    COUNTER.fetch_add(1, Ordering::Relaxed);
-	    self.serve_with_retry(routes)
+	    Box::pin(self.serve_with_retry(routes)).await
 	}
     }
-}
-
-use warp::Reply;
-use std::sync::atomic::{AtomicU8, Ordering};
-
-async fn get_latest_json(client: &Client, url: &str, download_url_base: &str, server_addr: &str) -> Result<Vec<u8>, reqwest::Error> {
-    let text: String = client.get(url).send().await?.text().await?;
-    Ok( text.replace(download_url_base, server_addr).into_bytes() )
-}
-
-async fn get_file(client: &Client, url: &str) -> Result<Vec<u8>, reqwest::Error> {
-    Ok( client.get(url).send().await?.bytes().await?.to_vec() )
 }
 
 /// Convenience method to serve the update immediately at `http://127.0.0.1:7748`
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```
+/// // this example is ignored since tauri is a huge and unnecessary dev dependency
 /// // in `src-tauri/src/lib.rs`
 /// # use std::error::Error;
 /// # use priv_tauri_updater::PrivUpdater;
-/// # use tauri::{AppHandle}
+/// # use tauri;
+/// # use tauri_plugin_updater::UpdaterExt;
 ///
 /// async fn update(app: tauri::AppHandle) -> Result<(), Box<dyn Error>> {
 ///     let update_server = priv_tauri_updater::serve("MyAccount", "MyRepo", "MyGitHubToken").await?;
 ///
 ///     if let Some(update) = app.updater()?.check().await? {
 ///
-///	// ... your chosen download logic here
+///         // ... your chosen download logic here
 ///
 ///     }
 ///
@@ -253,8 +257,18 @@ async fn get_file(client: &Client, url: &str) -> Result<Vec<u8>, reqwest::Error>
 /// - `gh_account_name`, `gh_repo_name`, or `gh_token` are incorrect for GitHub or invalid as HeaderNames (see [reqwest docs](https://docs.rs/reqwest/latest/reqwest/header/struct.HeaderValue.html#method.from_str))
 /// - there are network errors (e.g. no internet connection)
 /// - the server address `http://127.0.0.1:7748` is already in use
-pub async fn serve<D: std::fmt::Display>(gh_account_name: D, gh_repo_name: D, gh_token: D) -> Result<oneshot::Sender<()>, Box<dyn Error>> {
+pub async fn serve<D: std::fmt::Display>(gh_account_name: D, gh_repo_name: D, gh_token: D) -> Result<ShutdownSignal, Box<dyn Error>> {
     let updater = PrivUpdater::new(gh_account_name, gh_repo_name, gh_token, None::<([u8; 4], u16)>).await?;
     let shutdown_signal = updater.serve_update().await?;
     Ok( shutdown_signal )
+}
+
+
+async fn get_latest_json(client: &Client, url: &str, download_url_base: &str, server_addr: &str) -> Result<Vec<u8>, reqwest::Error> {
+    let text: String = client.get(url).send().await?.text().await?;
+    Ok( text.replace(download_url_base, server_addr).into_bytes() )
+}
+
+async fn get_file(client: &Client, url: &str) -> Result<Vec<u8>, reqwest::Error> {
+    Ok( client.get(url).send().await?.bytes().await?.to_vec() )
 }
